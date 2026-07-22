@@ -2,7 +2,7 @@ import { saveConfig } from "../config";
 import { isCodexAccountGenerationLive, readCodexAccountRecord } from "./account-store";
 import { codexAccountLogLabel } from "./account-label";
 import { isCodexAccountUsable } from "./account-usability";
-import { isAccountNeedsReauth, markAccountNeedsReauth } from "./account-runtime-state";
+import { isAccountNeedsReauth, markAccountNeedsReauth, isAccountInReauthProbe, clearAccountNeedsReauth } from "./account-runtime-state";
 import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota } from "./quota";
 import { MAIN_CODEX_ACCOUNT_ID, getMainAccountPlan } from "./main-account";
 import type { OcxConfig } from "../types";
@@ -41,6 +41,16 @@ export const CODEX_THREAD_AFFINITY_REEVAL_INTERVAL_MS = 60_000;
 
 const upstreamHealth = new Map<string, CodexUpstreamHealth>();
 
+/**
+ * Tracks the last time a cooldown probe was attempted for each account.
+ * Used to implement half-open circuit breaker behavior: after 50% of the
+ * cooldown has elapsed, we allow one request through as a probe every
+ * COOLDOWN_PROBE_INTERVAL_MS.
+ */
+const COOLDOWN_PROBE_INTERVAL_MS = 60_000; // 1 minute between probes
+const COOLDOWN_PROBE_ELAPSED_RATIO = 0.5;  // start probing after 50% of cooldown
+const cooldownProbeTimestamps = new Map<string, number>();
+
 export type CodexUpstreamOutcome = number | "connect_error" | "timeout";
 export type CodexUpstreamOutcomeClass = "success" | "credential" | "quota" | "transient" | "caller" | "unknown";
 export type CodexUpstreamOutcomeMeta = {
@@ -66,10 +76,12 @@ export function clearThreadAccountMapForAccount(accountId: string): void {
 
 export function clearCodexUpstreamHealth(): void {
   upstreamHealth.clear();
+  cooldownProbeTimestamps.clear();
 }
 
 export function clearCodexUpstreamHealthForAccount(accountId: string): void {
   upstreamHealth.delete(accountId);
+  cooldownProbeTimestamps.delete(accountId);
 }
 
 export function getCodexUpstreamHealth(
@@ -159,7 +171,33 @@ export function getCodexAccountCooldownUntil(accountId: string, now = Date.now()
 }
 
 export function isCodexAccountInCooldown(accountId: string, now = Date.now()): boolean {
-  return getCodexAccountCooldownUntil(accountId, now) !== null;
+  const cooldownUntil = getCodexAccountCooldownUntil(accountId, now);
+  if (cooldownUntil === null) return false;
+
+  // Half-open probe: after COOLDOWN_PROBE_ELAPSED_RATIO of the cooldown has
+  // passed, allow one request through periodically to test if the upstream
+  // has recovered early. Skip probing if the remaining cooldown is shorter
+  // than the probe interval — it will expire naturally soon enough.
+  const health = upstreamHealth.get(accountId);
+  if (health?.lastFailureAt) {
+    const totalCooldown = cooldownUntil - health.lastFailureAt;
+    const elapsed = now - health.lastFailureAt;
+    const remaining = cooldownUntil - now;
+    if (
+      totalCooldown > 0
+      && elapsed / totalCooldown >= COOLDOWN_PROBE_ELAPSED_RATIO
+      && remaining > COOLDOWN_PROBE_INTERVAL_MS
+    ) {
+      const lastProbe = cooldownProbeTimestamps.get(accountId) ?? 0;
+      if (now - lastProbe >= COOLDOWN_PROBE_INTERVAL_MS) {
+        cooldownProbeTimestamps.set(accountId, now);
+        console.log(`[codex-routing] cooldown probe allowed for "${accountId}" (${Math.round(elapsed / totalCooldown * 100)}% elapsed)`);
+        return false; // Allow this request through as a probe
+      }
+    }
+  }
+
+  return true;
 }
 
 function isCodexAccountSelectable(config: OcxConfig, accountId: string, now: number): boolean {
@@ -423,6 +461,12 @@ export function recordCodexUpstreamOutcome(
     const cooldownUntil = getCodexAccountCooldownUntil(accountId, now);
     if (cooldownUntil) upstreamHealth.set(accountId, { consecutiveFailures: 0, cooldownUntil });
     else upstreamHealth.delete(accountId);
+    cooldownProbeTimestamps.delete(accountId);
+    // If this account was in a reauth probe window and succeeded, clear the mark
+    if (isAccountInReauthProbe(accountId)) {
+      clearAccountNeedsReauth(accountId);
+      console.log(`[codex-routing] reauth probe succeeded for "${accountId}"; mark cleared`);
+    }
     return;
   }
   if (outcomeClass === "caller") return;
@@ -434,6 +478,8 @@ export function recordCodexUpstreamOutcome(
       lastFailureStatus,
       lastFailureAt: now,
     });
+    // If this was a probe request that failed, re-mark with backoff.
+    // If it's a fresh 401, mark for the first time.
     markAccountNeedsReauth(accountId);
     clearThreadAccountMapForAccount(accountId);
     return;

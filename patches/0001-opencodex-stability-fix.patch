@@ -1,0 +1,228 @@
+diff --git a/src/cli/index.ts b/src/cli/index.ts
+index b92fef1..ab710aa 100755
+--- a/src/cli/index.ts
++++ b/src/cli/index.ts
+@@ -116,12 +116,35 @@ async function handleStart(options: { block?: boolean } = {}) {
+   if (existingPid) {
+     const live = await findLiveProxy();
+     if (live) {
++      // When running as a launchd/systemd service, exit 0 signals "I'm done, no
++      // need to restart" — the existing instance is healthy and serving.
++      // exit(1) would cause KeepAlive to respawn us in a tight loop.
++      const isService = !!process.env.OCX_SERVICE;
++      if (isService) {
++        console.log(`ℹ️  Healthy proxy already running (PID ${live.pid ?? existingPid}, port ${live.port}). Service exiting cleanly.`);
++        process.exit(0);
++      }
+       console.error(`⚠️  Proxy already running (PID ${live.pid ?? existingPid}, port ${live.port}). Use 'ocx stop' first.`);
+       process.exit(1);
+     }
+     removePid(existingPid);
+   }
+ 
++  // Even without a PID file, another instance may be running (e.g. started
++  // manually or from a different path). Check before binding.
++  if (!existingPid) {
++    const live = await findLiveProxy();
++    if (live) {
++      const isService = !!process.env.OCX_SERVICE;
++      if (isService) {
++        console.log(`ℹ️  Healthy proxy already running (port ${live.port}). Service exiting cleanly.`);
++        process.exit(0);
++      }
++      console.error(`⚠️  Proxy already running (port ${live.port}). Use 'ocx stop' first.`);
++      process.exit(1);
++    }
++  }
++
+   // Interactive-only update prompt. Must run BEFORE we bind a port / write a
+   // PID: choosing "Update now" installs globally and exits, so we never want a
+   // live daemon holding resources while it overwrites its own binary.
+diff --git a/src/codex/account-runtime-state.ts b/src/codex/account-runtime-state.ts
+index 72e8021..df12a6c 100644
+--- a/src/codex/account-runtime-state.ts
++++ b/src/codex/account-runtime-state.ts
+@@ -1,13 +1,80 @@
+-const reauthAccounts = new Set<string>();
++/**
++ * Runtime reauth state with elastic recovery.
++ *
++ * Instead of permanently marking an account as needing reauthentication (which
++ * required a full OAuth re-login to clear), we now track a TTL-based probe
++ * schedule. After REAUTH_PROBE_INITIAL_MS, the account is temporarily allowed
++ * back into the pool for a single probe request. If the probe succeeds, the
++ * mark is cleared automatically. If it fails, the interval doubles (exponential
++ * backoff) up to REAUTH_PROBE_MAX_MS.
++ */
++
++export interface ReauthState {
++  markedAt: number;
++  attempts: number;
++  /** Next time a probe is allowed. Updated on each failed probe. */
++  nextProbeAt: number;
++}
++
++const REAUTH_PROBE_INITIAL_MS = 5 * 60_000;       // 5 minutes
++const REAUTH_PROBE_MAX_MS = 30 * 60_000;           // 30 minutes
++
++const reauthAccounts = new Map<string, ReauthState>();
+ 
+ export function markAccountNeedsReauth(id: string): void {
+-  reauthAccounts.add(id);
++  const existing = reauthAccounts.get(id);
++  const now = Date.now();
++  if (existing) {
++    // Re-mark after a failed probe: increment attempts, exponential backoff
++    const backoffMs = Math.min(
++      REAUTH_PROBE_INITIAL_MS * Math.pow(2, existing.attempts),
++      REAUTH_PROBE_MAX_MS,
++    );
++    reauthAccounts.set(id, {
++      markedAt: existing.markedAt,
++      attempts: existing.attempts + 1,
++      nextProbeAt: now + backoffMs,
++    });
++  } else {
++    // First mark: schedule initial probe
++    reauthAccounts.set(id, {
++      markedAt: now,
++      attempts: 0,
++      nextProbeAt: now + REAUTH_PROBE_INITIAL_MS,
++    });
++  }
+ }
+ 
++/**
++ * Returns true if the account is marked as needing reauth AND is not yet
++ * eligible for a probe. When a probe window opens (now >= nextProbeAt),
++ * this returns false to allow exactly one request through as a health probe.
++ */
+ export function isAccountNeedsReauth(id: string): boolean {
+-  return reauthAccounts.has(id);
++  const state = reauthAccounts.get(id);
++  if (!state) return false;
++  const now = Date.now();
++  // Probe window open: allow the account back temporarily
++  if (now >= state.nextProbeAt) return false;
++  return true;
++}
++
++/**
++ * Returns true if this account is currently in a probe window (was marked
++ * as needing reauth, but the probe interval has elapsed). Callers should
++ * use this to identify probe requests so that a success clears the mark
++ * and a failure re-marks with backoff.
++ */
++export function isAccountInReauthProbe(id: string): boolean {
++  const state = reauthAccounts.get(id);
++  if (!state) return false;
++  return Date.now() >= state.nextProbeAt;
+ }
+ 
+ export function clearAccountNeedsReauth(id: string): void {
+   reauthAccounts.delete(id);
+ }
++
++export function getReauthState(id: string): ReauthState | null {
++  return reauthAccounts.get(id) ?? null;
++}
+diff --git a/src/codex/routing.ts b/src/codex/routing.ts
+index b70fb91..7fe389d 100644
+--- a/src/codex/routing.ts
++++ b/src/codex/routing.ts
+@@ -2,7 +2,7 @@ import { saveConfig } from "../config";
+ import { isCodexAccountGenerationLive, readCodexAccountRecord } from "./account-store";
+ import { codexAccountLogLabel } from "./account-label";
+ import { isCodexAccountUsable } from "./account-usability";
+-import { isAccountNeedsReauth, markAccountNeedsReauth } from "./account-runtime-state";
++import { isAccountNeedsReauth, markAccountNeedsReauth, isAccountInReauthProbe, clearAccountNeedsReauth } from "./account-runtime-state";
+ import { CODEX_UNKNOWN_USAGE_SCORE, getAccountQuota } from "./quota";
+ import { MAIN_CODEX_ACCOUNT_ID, getMainAccountPlan } from "./main-account";
+ import type { OcxConfig } from "../types";
+@@ -41,6 +41,16 @@ export const CODEX_THREAD_AFFINITY_REEVAL_INTERVAL_MS = 60_000;
+ 
+ const upstreamHealth = new Map<string, CodexUpstreamHealth>();
+ 
++/**
++ * Tracks the last time a cooldown probe was attempted for each account.
++ * Used to implement half-open circuit breaker behavior: after 50% of the
++ * cooldown has elapsed, we allow one request through as a probe every
++ * COOLDOWN_PROBE_INTERVAL_MS.
++ */
++const COOLDOWN_PROBE_INTERVAL_MS = 60_000; // 1 minute between probes
++const COOLDOWN_PROBE_ELAPSED_RATIO = 0.5;  // start probing after 50% of cooldown
++const cooldownProbeTimestamps = new Map<string, number>();
++
+ export type CodexUpstreamOutcome = number | "connect_error" | "timeout";
+ export type CodexUpstreamOutcomeClass = "success" | "credential" | "quota" | "transient" | "caller" | "unknown";
+ export type CodexUpstreamOutcomeMeta = {
+@@ -66,10 +76,12 @@ export function clearThreadAccountMapForAccount(accountId: string): void {
+ 
+ export function clearCodexUpstreamHealth(): void {
+   upstreamHealth.clear();
++  cooldownProbeTimestamps.clear();
+ }
+ 
+ export function clearCodexUpstreamHealthForAccount(accountId: string): void {
+   upstreamHealth.delete(accountId);
++  cooldownProbeTimestamps.delete(accountId);
+ }
+ 
+ export function getCodexUpstreamHealth(
+@@ -159,7 +171,33 @@ export function getCodexAccountCooldownUntil(accountId: string, now = Date.now()
+ }
+ 
+ export function isCodexAccountInCooldown(accountId: string, now = Date.now()): boolean {
+-  return getCodexAccountCooldownUntil(accountId, now) !== null;
++  const cooldownUntil = getCodexAccountCooldownUntil(accountId, now);
++  if (cooldownUntil === null) return false;
++
++  // Half-open probe: after COOLDOWN_PROBE_ELAPSED_RATIO of the cooldown has
++  // passed, allow one request through periodically to test if the upstream
++  // has recovered early. Skip probing if the remaining cooldown is shorter
++  // than the probe interval — it will expire naturally soon enough.
++  const health = upstreamHealth.get(accountId);
++  if (health?.lastFailureAt) {
++    const totalCooldown = cooldownUntil - health.lastFailureAt;
++    const elapsed = now - health.lastFailureAt;
++    const remaining = cooldownUntil - now;
++    if (
++      totalCooldown > 0
++      && elapsed / totalCooldown >= COOLDOWN_PROBE_ELAPSED_RATIO
++      && remaining > COOLDOWN_PROBE_INTERVAL_MS
++    ) {
++      const lastProbe = cooldownProbeTimestamps.get(accountId) ?? 0;
++      if (now - lastProbe >= COOLDOWN_PROBE_INTERVAL_MS) {
++        cooldownProbeTimestamps.set(accountId, now);
++        console.log(`[codex-routing] cooldown probe allowed for "${accountId}" (${Math.round(elapsed / totalCooldown * 100)}% elapsed)`);
++        return false; // Allow this request through as a probe
++      }
++    }
++  }
++
++  return true;
+ }
+ 
+ function isCodexAccountSelectable(config: OcxConfig, accountId: string, now: number): boolean {
+@@ -423,6 +461,12 @@ export function recordCodexUpstreamOutcome(
+     const cooldownUntil = getCodexAccountCooldownUntil(accountId, now);
+     if (cooldownUntil) upstreamHealth.set(accountId, { consecutiveFailures: 0, cooldownUntil });
+     else upstreamHealth.delete(accountId);
++    cooldownProbeTimestamps.delete(accountId);
++    // If this account was in a reauth probe window and succeeded, clear the mark
++    if (isAccountInReauthProbe(accountId)) {
++      clearAccountNeedsReauth(accountId);
++      console.log(`[codex-routing] reauth probe succeeded for "${accountId}"; mark cleared`);
++    }
+     return;
+   }
+   if (outcomeClass === "caller") return;
+@@ -434,6 +478,8 @@ export function recordCodexUpstreamOutcome(
+       lastFailureStatus,
+       lastFailureAt: now,
+     });
++    // If this was a probe request that failed, re-mark with backoff.
++    // If it's a fresh 401, mark for the first time.
+     markAccountNeedsReauth(accountId);
+     clearThreadAccountMapForAccount(accountId);
+     return;

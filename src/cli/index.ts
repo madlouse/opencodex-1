@@ -116,10 +116,33 @@ async function handleStart(options: { block?: boolean } = {}) {
   if (existingPid) {
     const live = await findLiveProxy();
     if (live) {
+      // When running as a launchd/systemd service, exit 0 signals "I'm done, no
+      // need to restart" — the existing instance is healthy and serving.
+      // exit(1) would cause KeepAlive to respawn us in a tight loop.
+      const isService = !!process.env.OCX_SERVICE;
+      if (isService) {
+        console.log(`ℹ️  Healthy proxy already running (PID ${live.pid ?? existingPid}, port ${live.port}). Service exiting cleanly.`);
+        process.exit(0);
+      }
       console.error(`⚠️  Proxy already running (PID ${live.pid ?? existingPid}, port ${live.port}). Use 'ocx stop' first.`);
       process.exit(1);
     }
     removePid(existingPid);
+  }
+
+  // Even without a PID file, another instance may be running (e.g. started
+  // manually or from a different path). Check before binding.
+  if (!existingPid) {
+    const live = await findLiveProxy();
+    if (live) {
+      const isService = !!process.env.OCX_SERVICE;
+      if (isService) {
+        console.log(`ℹ️  Healthy proxy already running (port ${live.port}). Service exiting cleanly.`);
+        process.exit(0);
+      }
+      console.error(`⚠️  Proxy already running (port ${live.port}). Use 'ocx stop' first.`);
+      process.exit(1);
+    }
   }
 
   // Interactive-only update prompt. Must run BEFORE we bind a port / write a

@@ -1,13 +1,80 @@
-const reauthAccounts = new Set<string>();
+/**
+ * Runtime reauth state with elastic recovery.
+ *
+ * Instead of permanently marking an account as needing reauthentication (which
+ * required a full OAuth re-login to clear), we now track a TTL-based probe
+ * schedule. After REAUTH_PROBE_INITIAL_MS, the account is temporarily allowed
+ * back into the pool for a single probe request. If the probe succeeds, the
+ * mark is cleared automatically. If it fails, the interval doubles (exponential
+ * backoff) up to REAUTH_PROBE_MAX_MS.
+ */
 
-export function markAccountNeedsReauth(id: string): void {
-  reauthAccounts.add(id);
+export interface ReauthState {
+  markedAt: number;
+  attempts: number;
+  /** Next time a probe is allowed. Updated on each failed probe. */
+  nextProbeAt: number;
 }
 
+const REAUTH_PROBE_INITIAL_MS = 5 * 60_000;       // 5 minutes
+const REAUTH_PROBE_MAX_MS = 30 * 60_000;           // 30 minutes
+
+const reauthAccounts = new Map<string, ReauthState>();
+
+export function markAccountNeedsReauth(id: string): void {
+  const existing = reauthAccounts.get(id);
+  const now = Date.now();
+  if (existing) {
+    // Re-mark after a failed probe: increment attempts, exponential backoff
+    const backoffMs = Math.min(
+      REAUTH_PROBE_INITIAL_MS * Math.pow(2, existing.attempts),
+      REAUTH_PROBE_MAX_MS,
+    );
+    reauthAccounts.set(id, {
+      markedAt: existing.markedAt,
+      attempts: existing.attempts + 1,
+      nextProbeAt: now + backoffMs,
+    });
+  } else {
+    // First mark: schedule initial probe
+    reauthAccounts.set(id, {
+      markedAt: now,
+      attempts: 0,
+      nextProbeAt: now + REAUTH_PROBE_INITIAL_MS,
+    });
+  }
+}
+
+/**
+ * Returns true if the account is marked as needing reauth AND is not yet
+ * eligible for a probe. When a probe window opens (now >= nextProbeAt),
+ * this returns false to allow exactly one request through as a health probe.
+ */
 export function isAccountNeedsReauth(id: string): boolean {
-  return reauthAccounts.has(id);
+  const state = reauthAccounts.get(id);
+  if (!state) return false;
+  const now = Date.now();
+  // Probe window open: allow the account back temporarily
+  if (now >= state.nextProbeAt) return false;
+  return true;
+}
+
+/**
+ * Returns true if this account is currently in a probe window (was marked
+ * as needing reauth, but the probe interval has elapsed). Callers should
+ * use this to identify probe requests so that a success clears the mark
+ * and a failure re-marks with backoff.
+ */
+export function isAccountInReauthProbe(id: string): boolean {
+  const state = reauthAccounts.get(id);
+  if (!state) return false;
+  return Date.now() >= state.nextProbeAt;
 }
 
 export function clearAccountNeedsReauth(id: string): void {
   reauthAccounts.delete(id);
+}
+
+export function getReauthState(id: string): ReauthState | null {
+  return reauthAccounts.get(id) ?? null;
 }
